@@ -257,8 +257,26 @@ def send_post_to_telegram(category, thumb_word, title, body, thumb_path):
             safe_tg_send(msg_url, data={"chat_id": TG_CHAT_ID, "text": part.strip()})
             time.sleep(0.5)
 
+def is_naver_logged_in(context):
+    """브라우저 쿠키에 네이버 인증 토큰(NID_AUT)이 들어왔는지 정확히 판별"""
+    for c in context.cookies():
+        if c.get("name") == "NID_AUT" and c.get("value"):
+            return True
+    return False
+
+def click_login_submit(page):
+    """엔터키가 무시되는 현상을 막기 위해 실제 로그인 버튼을 찾아 클릭"""
+    for sel in ["button.btn_login", "#log\\.login", "button[type='submit']", "input[type='submit']"]:
+        try:
+            loc = page.locator(sel).first
+            if loc.is_visible(timeout=1000):
+                loc.click()
+                return
+        except Exception:
+            pass
+    page.keyboard.press("Enter")
+
 def skip_device_registration(page):
-    """로그인 직후 뜨는 '새로운 기기 등록' 화면을 감지해 자동으로 '등록안함' 클릭"""
     for sel in ["#new\\.dontsave", "a#new\\.dontsave", "button:has-text('등록안함')", "a:has-text('등록안함')", ".btn_cancel"]:
         try:
             if page.locator(sel).first.is_visible(timeout=1500):
@@ -267,6 +285,47 @@ def skip_device_registration(page):
                 break
         except Exception:
             pass
+
+def submit_captcha_answer(page, answer):
+    """비밀번호 칸과 캡차 입력칸을 찾아 값을 채우고 로그인 버튼 클릭"""
+    # 1. 비밀번호 재입력 칸
+    for pw_sel in ["input#pw", "input[name='pw']", "input[type='password']"]:
+        try:
+            loc = page.locator(pw_sel).first
+            if loc.is_visible(timeout=1000):
+                loc.click()
+                loc.fill(NAVER_PW)
+                break
+        except Exception:
+            pass
+            
+    # 2. 영수증 정답 입력 칸 (이름이 바뀌어도 텍스트 입력칸 중 마지막 칸을 자동 탐색)
+    filled = False
+    for cap_sel in ["input#captcha", "input[name='captcha']", "input#chptcha", "input[placeholder*='정답']", "input[placeholder*='입력']"]:
+        try:
+            loc = page.locator(cap_sel).first
+            if loc.is_visible(timeout=1000):
+                loc.click()
+                loc.fill(answer)
+                filled = True
+                break
+        except Exception:
+            pass
+            
+    if not filled:
+        # 만약 특수 ID로 되어 있다면 화면의 마지막 input 텍스트 박스에 입력
+        try:
+            inputs = page.locator("input[type='text']")
+            if inputs.count() >= 2:
+                inputs.last.click()
+                inputs.last.fill(answer)
+        except Exception:
+            pass
+
+    time.sleep(0.5)
+    click_login_submit(page)
+    time.sleep(5)
+    skip_device_registration(page)
 
 def save_to_naver_blog_with_image(title, body, thumb_abs_path):
     if not NAVER_ID or not NAVER_PW:
@@ -296,84 +355,66 @@ def save_to_naver_blog_with_image(title, body, thumb_abs_path):
             # 1차 로그인 시도
             id_box = page.locator("input#id, input[name='id']").first
             id_box.click()
-            id_box.type(NAVER_ID, delay=70)
+            id_box.fill(NAVER_ID)
             time.sleep(0.5)
             
             pw_box = page.locator("input#pw, input[name='pw']").first
             pw_box.click()
-            pw_box.type(NAVER_PW, delay=70)
+            pw_box.fill(NAVER_PW)
             time.sleep(0.5)
-            page.keyboard.press("Enter")
-            time.sleep(5)
             
+            click_login_submit(page)
+            time.sleep(5)
             skip_device_registration(page)
 
-            # URL이 아니라 실제로 화면에 '영수증 캡차 입력칸(input#captcha)'이 떠 있을 때만 작동!
-            cap_locator = page.locator("input#captcha, input[name='captcha']").first
-            if cap_locator.is_visible(timeout=2500):
-                page.screenshot(path="captcha.jpg", type="jpeg", quality=85)
+            # 쿠키(NID_AUT) 검사: 아직 로그인이 안 되었다면 (영수증 캡차 등 발생)
+            if not is_naver_logged_in(context):
+                page.screenshot(path="captcha1.jpg", type="jpeg", quality=85)
                 
-                # (1) Gemini Vision AI가 먼저 영수증 풀이 시도
+                # (1) AI가 먼저 영수증 이미지 판독 및 제출 시도
                 try:
                     ai_ans = call_gemini_fast(
                         "이 네이버 로그인 화면에 있는 영수증 이미지와 질문을 읽고, 빈칸에 들어갈 정답(숫자 또는 단어)만 딱 출력해줘. 단위나 부연설명 없이 오직 정답 글자만 출력해.",
-                        image_path="captcha.jpg"
+                        image_path="captcha1.jpg"
                     )
                     ai_ans = ai_ans.replace(" ", "").replace("\n", "")
-                    print(f"🤖 AI가 추론한 영수증 정답: {ai_ans}", flush=True)
-                    
-                    pw_loc = page.locator("input#pw, input[name='pw']").first
-                    if pw_loc.is_visible(timeout=2000):
-                        pw_loc.click()
-                        pw_loc.fill(NAVER_PW)
-                    
-                    cap_locator.click()
-                    cap_locator.fill(ai_ans)
-                    time.sleep(0.5)
-                    page.keyboard.press("Enter")
-                    time.sleep(5)
-                    skip_device_registration(page)
+                    print(f"🤖 AI 1차 영수증 추론 정답: {ai_ans}", flush=True)
+                    submit_captcha_answer(page, ai_ans)
                 except Exception as ce:
-                    print(f"AI 캡차 풀이 건너뜀: {ce}", flush=True)
+                    print(f"AI 캡차 풀이 오류: {ce}", flush=True)
 
-            # (2) AI가 틀려서 여전히 캡차 입력칸이 화면에 남아있을 때만 텔레그램으로 질문!
-            if cap_locator.is_visible(timeout=2500):
+            # (2) 다시 쿠키 검사: 여전히 로그인이 안 되었다면 무조건 텔레그램으로 현재 화면 전송 후 사용자 입력 대기!
+            if not is_naver_logged_in(context):
                 page.screenshot(path="captcha2.jpg", type="jpeg", quality=85)
                 with open("captcha2.jpg", "rb") as f:
                     safe_tg_send(
                         photo_url,
                         data={
                             "chat_id": TG_CHAT_ID,
-                            "caption": "🧾 [영수증 퀴즈 발생!]\n지금 70초 안에 이 채팅방에 위 영수증 문제의 정답만 딱 입력해 주세요!"
+                            "caption": "🧾 [로그인 추가 확인 필요]\n현재 로그인 창 화면입니다! 영수증 문제가 보이면 70초 안에 정답만 이 채팅방에 입력해 주세요!"
                         },
                         files={"photo": f}
                     )
                 user_ans = wait_for_telegram_reply(timeout_sec=70)
                 if user_ans:
-                    safe_tg_send(msg_url, data={"chat_id": TG_CHAT_ID, "text": f"👌 입력하신 정답 '{user_ans}'(으)로 로그인을 돌파합니다!"})
-                    pw_loc = page.locator("input#pw, input[name='pw']").first
-                    if pw_loc.is_visible(timeout=2000):
-                        pw_loc.click()
-                        pw_loc.fill(NAVER_PW)
-                    
-                    cap_locator.click()
-                    cap_locator.fill(user_ans)
-                    time.sleep(0.5)
-                    page.keyboard.press("Enter")
-                    time.sleep(5)
-                    skip_device_registration(page)
+                    safe_tg_send(msg_url, data={"chat_id": TG_CHAT_ID, "text": f"👌 입력하신 정답 '{user_ans}'(으)로 다시 로그인 버튼을 누릅니다!"})
+                    submit_captcha_answer(page, user_ans)
 
-            # 이제 바로 스마트에디터 글쓰기 창으로 직행!
-            page.goto(f"https://blog.naver.com/PostWriteForm.naver?blogId={NAVER_ID}", wait_until="domcontentloaded")
-            time.sleep(6)
-            
-            frame = page.frame(name="mainFrame") or page.main_frame
-            
-            # 만약 여전히 로그인 화면으로 튕겼다면 캡처 후 안내
-            if "nidlogin" in page.url:
+            # 최종 로그인 성공 여부 확인
+            if not is_naver_logged_in(context):
                 page.screenshot(path="status.jpg", type="jpeg", quality=80)
                 browser.close()
-                return "❌ 로그인 세션을 유지하지 못했습니다. 아래 캡처 화면을 확인해 주세요."
+                return "❌ 네이버 로그인 인증(쿠키 발급)에 실패했습니다. 아래 캡처 화면의 안내 문구를 확인해 주세요."
+
+            # 로그인 성공(NID_AUT 확보)! 스마트에디터 글쓰기 창으로 이동
+            page.goto(f"https://blog.naver.com/{NAVER_ID}?Redirect=Write&", wait_until="domcontentloaded")
+            time.sleep(6)
+            
+            frame = page.frame(name="mainFrame")
+            if not frame:
+                page.goto(f"https://blog.naver.com/PostWriteForm.naver?blogId={NAVER_ID}", wait_until="domcontentloaded")
+                time.sleep(5)
+                frame = page.frame(name="mainFrame") or page.main_frame
                 
             for selector in [".se-popup-button-cancel", ".se-help-panel-close-button"]:
                 try:
@@ -388,7 +429,7 @@ def save_to_naver_blog_with_image(title, body, thumb_abs_path):
             time.sleep(0.5)
             page.keyboard.insert_text(title)
             
-            # 2. 본문 첫 줄 클릭 후 맨 위에 1000x1000 썸네일 업로드
+            # 2. 본문 첫 줄에 1000x1000 썸네일 업로드
             frame.locator(".se-component.se-text .se-text-paragraph").first.click()
             time.sleep(0.5)
             try:
