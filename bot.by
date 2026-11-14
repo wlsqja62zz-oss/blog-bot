@@ -6,9 +6,9 @@ from bs4 import BeautifulSoup
 from google import genai
 from PIL import Image, ImageDraw, ImageFont
 
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
-TG_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+TG_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 KEYWORD = os.environ.get("TARGET_KEYWORD", "속보 특징주")
 
 def get_news_without_api(keyword):
