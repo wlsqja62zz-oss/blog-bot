@@ -47,7 +47,8 @@ def write_blog(keyword, news_text):
     [뉴스 데이터]
     {news_text}
     """
-    res = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+    # 최신 모델인 gemini-3.8-flash 로 업데이트 완료!
+    res = client.models.generate_content(model='gemini-3.8-flash', contents=prompt)
     return res.text
 
 def make_thumbnail(text):
