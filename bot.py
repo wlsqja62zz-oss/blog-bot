@@ -1,5 +1,6 @@
 import os
 import time
+import base64
 import random
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -28,7 +29,6 @@ INFO_TOPICS = [
 ]
 
 def safe_tg_send(url, data, files=None):
-    """텔레그램 전송 시 타임아웃으로 프로그램이 꺼지지 않도록 2회 재시도 및 안전 보호"""
     for attempt in range(2):
         try:
             if files:
@@ -38,39 +38,58 @@ def safe_tg_send(url, data, files=None):
             if res.status_code == 200:
                 return True
         except Exception as e:
-            print(f"⚠️ 텔레그램 전송 지연 ({attempt+1}차 시도): {e}", flush=True)
+            print(f"⚠️ 텔레그램 전송 지연 ({attempt+1}차): {e}", flush=True)
             time.sleep(2)
     return False
 
-def call_gemini_fast(prompt):
-    # 방금 성공 확인된 gemini-flash-latest 및 gemini-flash-lite-latest를 최우선 배치
-    models = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-3.8-flash", "gemini-3.8-pro"]
-    try:
-        r_list = requests.get(f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_KEY}", timeout=5)
-        if r_list.status_code == 200:
-            for m in r_list.json().get("models", []):
-                name = m.get("name", "").replace("models/", "")
-                if "gemini" in name and "generateContent" in m.get("supportedGenerationMethods", []):
-                    if name not in models and "2.5" not in name:
-                        models.append(name)
-    except Exception:
-        pass
+def call_gemini_fast(prompt, image_path=None):
+    """텍스트 생성 및 영수증 이미지 판독(Vision) 겸용 고속 호출"""
+    models = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-3.8-flash", "gemini-2.0-flash"]
+    
+    parts = [{"text": prompt}]
+    if image_path and os.path.exists(image_path):
+        with open(image_path, "rb") as f:
+            b64_img = base64.b64encode(f.read()).decode("utf-8")
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": b64_img}})
 
     for model_name in models:
-        print(f"👉 [{model_name}] 모델로 원고 생성 중...", flush=True)
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_KEY}"
-        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+        payload = {"contents": [{"parts": parts}]}
         try:
             res = requests.post(url, json=payload, timeout=30)
             if res.status_code == 200:
                 data = res.json()
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
-                print(f"✅ [{model_name}] 원고 생성 성공!", flush=True)
-                return text
+                return data["candidates"][0]["content"]["parts"][0]["text"].strip()
         except Exception:
             continue
-            
-    raise RuntimeError("모든 Gemini 모델이 현재 응답하지 않습니다. 잠시 후 다시 실행해 주세요.")
+    raise RuntimeError("Gemini 응답 실패")
+
+def wait_for_telegram_reply(timeout_sec=75):
+    """사용자가 텔레그램 채팅창에 입력한 영수증 정답을 실시간으로 읽어옴"""
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"
+    last_update_id = 0
+    try:
+        r = requests.get(url, timeout=10).json()
+        if r.get("result"):
+            last_update_id = r["result"][-1]["update_id"]
+    except Exception:
+        pass
+
+    start_t = time.time()
+    while time.time() - start_t < timeout_sec:
+        time.sleep(3)
+        try:
+            r = requests.get(url, params={"offset": last_update_id + 1, "timeout": 5}, timeout=10).json()
+            for item in r.get("result", []):
+                last_update_id = item["update_id"]
+                msg = item.get("message", {})
+                if str(msg.get("chat", {}).get("id")) == str(TG_CHAT_ID):
+                    user_text = msg.get("text", "").strip()
+                    if user_text:
+                        return user_text
+        except Exception:
+            pass
+    return None
 
 def select_topic_and_fetch_news(user_keyword):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -212,13 +231,11 @@ def make_free_ai_thumbnail(thumb_word, bg_prompt):
         draw.text((x + dx, y + dy), thumb_word, font=font, fill=(0, 0, 0))
     draw.text((x, y), thumb_word, font=font, fill=(255, 255, 255))
     
-    # 전송 속도 5배 향상을 위해 고화질 JPEG(품질 92%)로 저장
     abs_path = os.path.abspath("thumb.jpg")
     img.save(abs_path, format="JPEG", quality=92)
     return abs_path
 
 def send_post_to_telegram(category, thumb_word, title, body, thumb_path):
-    print("📲 텔레그램으로 썸네일 및 본문 발송 중...", flush=True)
     photo_url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
     caption_text = f"🏷️ 분류: [{category}] ({thumb_word})\n📌 제목:\n{title}"
     
@@ -244,9 +261,11 @@ def send_post_to_telegram(category, thumb_word, title, body, thumb_path):
 
 def save_to_naver_blog_with_image(title, body, thumb_abs_path):
     if not NAVER_ID or not NAVER_PW:
-        return "ℹ️ 네이버 ID/PW 미입력 상태 (Secrets 확인 필요)"
+        return "ℹ️ 네이버 ID/PW 미입력 상태"
         
-    print("🌐 네이버 블로그 스마트에디터 접속 중...", flush=True)
+    photo_url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
+    msg_url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -265,19 +284,71 @@ def save_to_naver_blog_with_image(title, body, thumb_abs_path):
             page.goto("https://nid.naver.com/nidlogin.login?locale=ko_KR", wait_until="domcontentloaded")
             time.sleep(2)
             
+            # 1차 로그인 시도: 실제 사람처럼 한 글자씩 타이핑
             id_box = page.locator("input#id, input[name='id']").first
             id_box.click()
-            page.keyboard.insert_text(NAVER_ID)
+            id_box.type(NAVER_ID, delay=80)
             time.sleep(0.5)
             
             pw_box = page.locator("input#pw, input[name='pw']").first
             pw_box.click()
-            page.keyboard.insert_text(NAVER_PW)
+            pw_box.type(NAVER_PW, delay=80)
             time.sleep(0.5)
-            
             page.keyboard.press("Enter")
             time.sleep(5)
             
+            # 만약 영수증 캡차 화면이 떴다면? -> 1단계: AI가 먼저 풀기 / 2단계: 텔레그램으로 물어보기
+            if "nidlogin" in page.url:
+                page.screenshot(path="captcha.jpg", type="jpeg", quality=85)
+                
+                # (1) Gemini Vision AI에게 영수증 문제 풀어달라고 요청
+                try:
+                    ai_ans = call_gemini_fast(
+                        "이 네이버 로그인 화면에 있는 영수증 이미지와 질문을 읽고, 빈칸에 들어갈 정답(숫자 또는 단어)만 딱 출력해줘. 단위나 부연설명 없이 오직 정답 글자만 출력해.",
+                        image_path="captcha.jpg"
+                    )
+                    ai_ans = ai_ans.replace(" ", "").replace("\n", "")
+                    print(f"🤖 AI가 추론한 영수증 정답: {ai_ans}", flush=True)
+                    
+                    pw_box = page.locator("input#pw, input[name='pw']").first
+                    pw_box.click()
+                    pw_box.fill(NAVER_PW)
+                    
+                    cap_box = page.locator("input#captcha, input[name='captcha']").first
+                    cap_box.click()
+                    cap_box.fill(ai_ans)
+                    time.sleep(0.5)
+                    page.keyboard.press("Enter")
+                    time.sleep(5)
+                except Exception as ce:
+                    print(f"AI 캡차 풀이 건너뜀: {ce}", flush=True)
+
+            # (2) 그래도 아직 영수증 화면이라면 -> 내 텔레그램으로 사진 보내고 내가 친 정답 받아서 입력!
+            if "nidlogin" in page.url:
+                page.screenshot(path="captcha2.jpg", type="jpeg", quality=85)
+                with open("captcha2.jpg", "rb") as f:
+                    safe_tg_send(
+                        photo_url,
+                        data={
+                            "chat_id": TG_CHAT_ID,
+                            "caption": "🧾 [영수증 퀴즈 발생!]\n지금 70초 안에 이 채팅방에 위 영수증 문제의 정답만 딱 입력해 주세요! (예: 4500 또는 떡볶이)"
+                        },
+                        files={"photo": f}
+                    )
+                user_ans = wait_for_telegram_reply(timeout_sec=70)
+                if user_ans:
+                    safe_tg_send(msg_url, data={"chat_id": TG_CHAT_ID, "text": f"👌 입력하신 정답 '{user_ans}'(으)로 로그인을 돌파합니다!"})
+                    pw_box = page.locator("input#pw, input[name='pw']").first
+                    pw_box.click()
+                    pw_box.fill(NAVER_PW)
+                    
+                    cap_box = page.locator("input#captcha, input[name='captcha']").first
+                    cap_box.click()
+                    cap_box.fill(user_ans)
+                    time.sleep(0.5)
+                    page.keyboard.press("Enter")
+                    time.sleep(5)
+
             try:
                 if page.locator("#new\\.dontsave, a#new\\.dontsave").is_visible(timeout=2000):
                     page.locator("#new\\.dontsave, a#new\\.dontsave").click()
@@ -288,8 +359,9 @@ def save_to_naver_blog_with_image(title, body, thumb_abs_path):
             if "nidlogin" in page.url:
                 page.screenshot(path="status.jpg", type="jpeg", quality=80)
                 browser.close()
-                return "⚠️ 네이버 로그인 단계에서 보안 확인(캡차/해외차단/2단계인증)이 떴습니다. 아래 캡처 화면을 확인해 주세요!"
+                return "❌ 영수증 정답 불일치 또는 로그인 제한으로 진입하지 못했습니다."
                 
+            # 스마트에디터 진입
             page.goto(f"https://blog.naver.com/{NAVER_ID}?Redirect=Write&", wait_until="domcontentloaded")
             time.sleep(5)
             
