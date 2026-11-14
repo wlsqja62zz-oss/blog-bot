@@ -27,8 +27,24 @@ INFO_TOPICS = [
     "환율 상승기 수혜 업종과 달러 ETF 투자 체크포인트"
 ]
 
+def safe_tg_send(url, data, files=None):
+    """텔레그램 전송 시 타임아웃으로 프로그램이 꺼지지 않도록 2회 재시도 및 안전 보호"""
+    for attempt in range(2):
+        try:
+            if files:
+                for f in files.values():
+                    f.seek(0)
+            res = requests.post(url, data=data, files=files, timeout=35)
+            if res.status_code == 200:
+                return True
+        except Exception as e:
+            print(f"⚠️ 텔레그램 전송 지연 ({attempt+1}차 시도): {e}", flush=True)
+            time.sleep(2)
+    return False
+
 def call_gemini_fast(prompt):
-    models = ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.8-pro", "gemini-2.0-flash"]
+    # 방금 성공 확인된 gemini-flash-latest 및 gemini-flash-lite-latest를 최우선 배치
+    models = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-3.8-flash", "gemini-3.8-pro"]
     try:
         r_list = requests.get(f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_KEY}", timeout=5)
         if r_list.status_code == 200:
@@ -41,14 +57,16 @@ def call_gemini_fast(prompt):
         pass
 
     for model_name in models:
-        print(f"👉 [{model_name}] 모델로 빠른 원고 생성 시도 중...", flush=True)
+        print(f"👉 [{model_name}] 모델로 원고 생성 중...", flush=True)
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_KEY}"
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
         try:
-            res = requests.post(url, json=payload, timeout=25)
+            res = requests.post(url, json=payload, timeout=30)
             if res.status_code == 200:
                 data = res.json()
-                return data["candidates"][0]["content"]["parts"][0]["text"]
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                print(f"✅ [{model_name}] 원고 생성 성공!", flush=True)
+                return text
         except Exception:
             continue
             
@@ -157,7 +175,7 @@ def make_free_ai_thumbnail(thumb_word, bg_prompt):
         encoded_bg = urllib.parse.quote(full_prompt)
         seed = random.randint(1, 99999)
         bg_url = f"https://image.pollinations.ai/prompt/{encoded_bg}?width=1000&height=1000&nologo=true&seed={seed}"
-        r = requests.get(bg_url, timeout=6)
+        r = requests.get(bg_url, timeout=8)
         if r.status_code == 200 and len(r.content) > 5000:
             img = Image.open(BytesIO(r.content)).convert("RGB").resize((1000, 1000))
             img = ImageEnhance.Brightness(img).enhance(0.45)
@@ -194,21 +212,23 @@ def make_free_ai_thumbnail(thumb_word, bg_prompt):
         draw.text((x + dx, y + dy), thumb_word, font=font, fill=(0, 0, 0))
     draw.text((x, y), thumb_word, font=font, fill=(255, 255, 255))
     
-    abs_path = os.path.abspath("thumb.png")
-    img.save(abs_path)
+    # 전송 속도 5배 향상을 위해 고화질 JPEG(품질 92%)로 저장
+    abs_path = os.path.abspath("thumb.jpg")
+    img.save(abs_path, format="JPEG", quality=92)
     return abs_path
 
-def send_post_to_telegram(category, thumb_word, title, body):
+def send_post_to_telegram(category, thumb_word, title, body, thumb_path):
+    print("📲 텔레그램으로 썸네일 및 본문 발송 중...", flush=True)
     photo_url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
     caption_text = f"🏷️ 분류: [{category}] ({thumb_word})\n📌 제목:\n{title}"
     
-    with open("thumb.png", "rb") as f:
-        requests.post(photo_url, data={"chat_id": TG_CHAT_ID, "caption": caption_text}, files={"photo": f}, timeout=10)
+    with open(thumb_path, "rb") as f:
+        safe_tg_send(photo_url, data={"chat_id": TG_CHAT_ID, "caption": caption_text}, files={"photo": f})
         
     msg_url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     max_len = 3800
     if len(body) <= max_len:
-        requests.post(msg_url, data={"chat_id": TG_CHAT_ID, "text": body}, timeout=10)
+        safe_tg_send(msg_url, data={"chat_id": TG_CHAT_ID, "text": body})
     else:
         parts, current = [], ""
         for line in body.split('\n'):
@@ -219,15 +239,15 @@ def send_post_to_telegram(category, thumb_word, title, body):
                 current += line + "\n"
         if current: parts.append(current)
         for part in parts:
-            requests.post(msg_url, data={"chat_id": TG_CHAT_ID, "text": part.strip()}, timeout=10)
+            safe_tg_send(msg_url, data={"chat_id": TG_CHAT_ID, "text": part.strip()})
+            time.sleep(0.5)
 
 def save_to_naver_blog_with_image(title, body, thumb_abs_path):
-    """로그인 버튼 locator 오류를 없애고 직접 입력 + Enter 키 방식으로 개선"""
     if not NAVER_ID or not NAVER_PW:
-        return "ℹ️ 네이버 ID/PW 미입력 상태 (Secrets에 NAVER_ID, NAVER_PW가 등록되어 있는지 확인해 주세요)"
+        return "ℹ️ 네이버 ID/PW 미입력 상태 (Secrets 확인 필요)"
         
+    print("🌐 네이버 블로그 스마트에디터 접속 중...", flush=True)
     with sync_playwright() as p:
-        # 자동화 탐지(봇 차단) 우회 옵션 추가
         browser = p.chromium.launch(
             headless=True,
             args=["--disable-blink-features=AutomationControlled"]
@@ -242,11 +262,9 @@ def save_to_naver_blog_with_image(title, body, thumb_abs_path):
         page.set_default_timeout(12000)
         
         try:
-            # 한국어 로그인 창으로 명시적 이동
             page.goto("https://nid.naver.com/nidlogin.login?locale=ko_KR", wait_until="domcontentloaded")
             time.sleep(2)
             
-            # ID/PW 입력창을 찾아 클릭 후 직접 입력하고 Enter 키로 로그인 실행 (#log.login 버튼 의존 제거!)
             id_box = page.locator("input#id, input[name='id']").first
             id_box.click()
             page.keyboard.insert_text(NAVER_ID)
@@ -257,11 +275,9 @@ def save_to_naver_blog_with_image(title, body, thumb_abs_path):
             page.keyboard.insert_text(NAVER_PW)
             time.sleep(0.5)
             
-            # 엔터키로 즉시 로그인 제출
             page.keyboard.press("Enter")
             time.sleep(5)
             
-            # 새로운 기기 등록 안내창이 뜨면 '등록안함(건너뛰기)' 클릭
             try:
                 if page.locator("#new\\.dontsave, a#new\\.dontsave").is_visible(timeout=2000):
                     page.locator("#new\\.dontsave, a#new\\.dontsave").click()
@@ -270,22 +286,19 @@ def save_to_naver_blog_with_image(title, body, thumb_abs_path):
                 pass
 
             if "nidlogin" in page.url:
-                page.screenshot(path="status.png")
+                page.screenshot(path="status.jpg", type="jpeg", quality=80)
                 browser.close()
                 return "⚠️ 네이버 로그인 단계에서 보안 확인(캡차/해외차단/2단계인증)이 떴습니다. 아래 캡처 화면을 확인해 주세요!"
                 
-            # 스마트에디터 글쓰기 페이지로 직행
             page.goto(f"https://blog.naver.com/{NAVER_ID}?Redirect=Write&", wait_until="domcontentloaded")
             time.sleep(5)
             
             frame = page.frame(name="mainFrame")
             if not frame:
-                # 최신 네이버 블로그 URL 구조(PostWriteForm)로 한 번 더 시도
                 page.goto(f"https://blog.naver.com/PostWriteForm.naver?blogId={NAVER_ID}", wait_until="domcontentloaded")
                 time.sleep(4)
                 frame = page.frame(name="mainFrame") or page.main_frame
                 
-            # 팝업창 닫기
             for selector in [".se-popup-button-cancel", ".se-help-panel-close-button"]:
                 try:
                     if frame.locator(selector).is_visible(timeout=1500):
@@ -294,12 +307,10 @@ def save_to_naver_blog_with_image(title, body, thumb_abs_path):
                 except Exception:
                     pass
                     
-            # 1. 제목 입력
             frame.locator(".se-documentTitle .se-text-paragraph").first.click()
             time.sleep(0.5)
             page.keyboard.insert_text(title)
             
-            # 2. 본문 첫 줄에 썸네일 이미지 업로드
             frame.locator(".se-component.se-text .se-text-paragraph").first.click()
             time.sleep(0.5)
             try:
@@ -313,19 +324,17 @@ def save_to_naver_blog_with_image(title, body, thumb_abs_path):
             except Exception:
                 pass
                 
-            # 3. 본문 텍스트 입력
             page.keyboard.insert_text(body)
             time.sleep(2)
             
-            # 4. 임시저장 클릭
             frame.locator("button:has-text('저장'), .save_btn__bzc5B").first.click()
             time.sleep(3)
             
-            page.screenshot(path="status.png")
+            page.screenshot(path="status.jpg", type="jpeg", quality=80)
             browser.close()
             return "✅ 네이버 블로그 [맨 위 썸네일 + 아래 본문] 자동 임시저장 완료!"
         except Exception as e:
-            try: page.screenshot(path="status.png")
+            try: page.screenshot(path="status.jpg", type="jpeg", quality=80)
             except Exception: pass
             browser.close()
             return f"⚠️ 네이버 임시저장 중 멈춤: {str(e)[:90]}"
@@ -352,12 +361,14 @@ if __name__ == "__main__":
     final_body = "\n".join(body_lines).strip()
     
     thumb_path = make_free_ai_thumbnail(thumb_word, bg_prompt)
-    send_post_to_telegram(category, thumb_word, title_txt, final_body)
+    send_post_to_telegram(category, thumb_word, title_txt, final_body, thumb_path)
     
     status_msg = save_to_naver_blog_with_image(title_txt, final_body, thumb_path)
     msg_url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    requests.post(msg_url, data={"chat_id": TG_CHAT_ID, "text": status_msg}, timeout=10)
-    if os.path.exists("status.png"):
+    safe_tg_send(msg_url, data={"chat_id": TG_CHAT_ID, "text": status_msg})
+    
+    if os.path.exists("status.jpg"):
         photo_url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
-        with open("status.png", "rb") as f:
-            requests.post(photo_url, data={"chat_id": TG_CHAT_ID, "caption": "🖥️ 네이버 에디터 실행 화면"}, files={"photo": f}, timeout=10)
+        with open("status.jpg", "rb") as f:
+            safe_tg_send(photo_url, data={"chat_id": TG_CHAT_ID, "caption": "🖥️ 네이버 에디터 실행 화면"}, files={"photo": f})
+    print("🎉 모든 작업이 완료되었습니다!", flush=True)
