@@ -16,12 +16,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Korean Font & Playwright Browser
+      - name: Quick Install Packages & Browser
         run: |
-          sudo apt-get update
           sudo apt-get install -y fonts-nanum
           pip install requests beautifulsoup4 google-genai pillow playwright
-          playwright install --with-deps chromium
+          playwright install chromium
       - name: Run Bot
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
